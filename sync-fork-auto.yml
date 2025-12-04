@@ -1,0 +1,97 @@
+name: 一键自动同步 Fork 仓库（自动检测源仓库 + 代码 + Tags）
+
+on:
+  workflow_dispatch:   # 手动触发，推荐
+  # schedule:
+  #   - cron: '0 0 * * *'  # 可选：每天 UTC 00:00 自动同步
+
+jobs:
+  sync-fork:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+
+    steps:
+      # ----------------------------------------------
+      # Step 1: 获取当前仓库信息，并查询上游（源）仓库
+      # ----------------------------------------------
+      - name: Get current repository info
+        id: repo_info
+        run: |
+          echo "当前仓库: ${{ github.repository }}"
+          echo "仓库所有者: ${{ github.repository_owner }}"
+          echo "仓库名称: ${{ github.event.repository.name }}"
+
+          REPO_INFO=$(curl -s -H "Authorization: token ${{ secrets.GITHUB_TOKEN }}" \
+            https://api.github.com/repos/${{ github.repository }})
+
+          DEFAULT_BRANCH=$(echo "$REPO_INFO" | jq -r '.default_branch')
+          IS_FORK=$(echo "$REPO_INFO" | jq -r '.fork')
+
+          if [ "$IS_FORK" != "true" ]; then
+            echo "❌ 当前仓库不是 Fork 仓库，无法自动检测源仓库。"
+            echo "✅ 请确认你已手动 Fork 了某个上游仓库。"
+            exit 1
+          fi
+
+          UPSTREAM_FULL_NAME=$(echo "$REPO_INFO" | jq -r '.parent.full_name')
+          echo "检测到源仓库（上游）: $UPSTREAM_FULL_NAME"
+          echo "当前仓库默认分支: $DEFAULT_BRANCH"
+
+          echo "upstream_full_name=$UPSTREAM_FULL_NAME" >> $GITHUB_OUTPUT
+          echo "target_repo=${{ github.repository }}" >> $GITHUB_OUTPUT
+          echo "default_branch=$DEFAULT_BRANCH" >> $GITHUB_OUTPUT
+
+      # ----------------------------------------------
+      # Step 2: Checkout 你的 Fork 仓库（使用自动检测的默认分支）
+      # ----------------------------------------------
+      - name: Checkout your fork (自动分支)
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ steps.repo_info.outputs.default_branch }}
+          token: ${{ secrets.MY_GIT_TOKEN }}
+          fetch-depth: 0
+
+      - name: Set Git Identity
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+
+      # ----------------------------------------------
+      # Step 3: 获取源仓库信息并设置远程
+      # ----------------------------------------------
+      - name: Add upstream remote (源仓库)
+        run: |
+          UPSTREAM_REPO=${{ steps.repo_info.outputs.upstream_full_name }}
+          echo "添加远程源仓库: $UPSTREAM_REPO"
+
+          UPSTREAM_INFO=$(curl -s -H "Authorization: token ${{ secrets.GITHUB_TOKEN }}" \
+            https://api.github.com/repos/$UPSTREAM_REPO)
+          UPSTREAM_DEFAULT_BRANCH=$(echo "$UPSTREAM_INFO" | jq -r '.default_branch')
+          echo "源仓库默认分支: $UPSTREAM_DEFAULT_BRANCH"
+
+          git remote add upstream https://github.com/$UPSTREAM_REPO.git
+
+          echo "upstream_default_branch=$UPSTREAM_DEFAULT_BRANCH" >> $GITHUB_OUTPUT
+
+      - name: Fetch upstream（代码 + Tags）
+        run: |
+          UPSTREAM_DEFAULT_BRANCH=${{ steps.repo_info.outputs.upstream_default_branch }}
+          echo "🔁 获取源仓库代码和 Tags（分支: $UPSTREAM_DEFAULT_BRANCH）"
+          git fetch upstream --tags
+
+      - name: Push all tags to your fork
+        run: |
+          git push origin --tags
+
+      - name: Merge upstream/{{ steps.repo_info.outputs.upstream_default_branch }}
+        run: |
+          UPSTREAM_DEFAULT_BRANCH=${{ steps.repo_info.outputs.upstream_default_branch }}
+          echo "🔀 合并源仓库分支: upstream/$UPSTREAM_DEFAULT_BRANCH"
+          git merge upstream/$UPSTREAM_DEFAULT_BRANCH --allow-unrelated-histories -X theirs || echo "Already up-to-date or no changes"
+
+      - name: Push code to your fork (当前默认分支)
+        run: |
+          DEFAULT_BRANCH=${{ steps.repo_info.outputs.default_branch }}
+          echo "📤 推送代码到你的 fork（分支: $DEFAULT_BRANCH）"
+          git remote set-url origin https://${{ secrets.MY_GIT_TOKEN }}@github.com/${{ github.repository }}.git
+          git push origin $DEFAULT_BRANCH
